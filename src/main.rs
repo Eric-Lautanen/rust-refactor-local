@@ -171,7 +171,8 @@ fn parse_error_files(errors: &[String], root: &Path) -> Vec<PathBuf> {
     paths.into_iter().collect()
 }
 
-// Data passed from the locked state to render_editor without holding the lock.
+// Snapshot of file state for rendering — built inside a scoped lock and passed
+// to render_editor so the mutex is never held while egui lays out widgets.
 struct EditorRenderData {
     display_content: String,
     is_animating: bool,
@@ -363,6 +364,7 @@ struct RefactorApp {
     available_models: Vec<ModelInfo>,
     selected_model_idx: usize,
     context_length: u32,
+    analysis_prompt: String,
     // Cancels any in-flight LLM stream when set to true (pause / close folder).
     llm_cancel: Arc<AtomicBool>,
     // File-switch diffusion effect
@@ -398,6 +400,7 @@ impl RefactorApp {
             available_models: Vec::new(),
             selected_model_idx: 0,
             context_length: DEFAULT_CONTEXT,
+            analysis_prompt: "Analyze the following Rust file and identify specific improvements.".into(),
             llm_cancel: Arc::new(AtomicBool::new(false)),
             transition_start: None,
             transition_from_content: String::new(),
@@ -720,10 +723,11 @@ impl RefactorApp {
         let ctx = self.egui_ctx.clone();
         let model_key = self.current_model_key();
         let cancel = self.llm_cancel.clone();
+        let instruction = self.analysis_prompt.clone();
         tokio::spawn(async move {
             let _ = tx.send(Message::Log(format!("⏳ Analyzing {}...", path)));
             let prompt = format!(
-                r#"Answer ONLY in JSON matching this exact schema. Analyze the following Rust file and identify specific improvements:
+                r#"{instruction} Answer ONLY in JSON matching this exact schema:
 
 {{
   "fixes": [
@@ -813,6 +817,8 @@ SOURCE ({path}):
         let _ = tx.send(Message::SetFileStatus(file_index, FileStatus::Analyzing));
         let request_start = Instant::now();
 
+        // Fresh client per request — avoids stale keep-alive connections from
+        // LM Studio's short 5-second idle timeout between files.
         let client = match reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(TIMEOUT_LLM_CONNECT_SECS))
             .build()
@@ -1138,7 +1144,6 @@ SOURCE ({path}):
                         .family(egui::FontFamily::Monospace),
                 );
                 ui.add_space(6.0);
-                // Pulsing status dot
                 let (resp, painter) =
                     ui.allocate_painter(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 painter.circle_filled(resp.rect.center(), 4.0, dot_color);
@@ -1348,6 +1353,35 @@ SOURCE ({path}):
                 ui.add(egui::Separator::default().spacing(0.0));
                 ui.add_space(10.0);
 
+                // Prompt section
+                ui.label(
+                    egui::RichText::new("PROMPT")
+                        .color(C_TEXT_MUTED)
+                        .size(10.0)
+                        .strong()
+                        .family(egui::FontFamily::Monospace),
+                );
+                ui.add_space(6.0);
+                egui::Frame::NONE
+                    .fill(C_RAISED)
+                    .corner_radius(4)
+                    .stroke(egui::Stroke::new(1.0, C_BORDER))
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.analysis_prompt)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .text_color(C_TEXT)
+                                .frame(false),
+                        );
+                    });
+
+                ui.add_space(12.0);
+                ui.add(egui::Separator::default().spacing(0.0));
+                ui.add_space(10.0);
+
                 // Source folder controls
                 ui.label(
                     egui::RichText::new("SOURCE")
@@ -1533,7 +1567,6 @@ SOURCE ({path}):
     }
 
     fn render_editor(&mut self, ui: &mut egui::Ui) {
-        // Outer frame acts as the editor chrome
         egui::Frame::NONE
             .fill(C_SURFACE)
             .stroke(egui::Stroke::new(1.0, C_BORDER))
@@ -1566,7 +1599,6 @@ SOURCE ({path}):
                     }
                     self.last_shown_file_idx = Some(shown_idx);
 
-
                     // Override display_content while the transition is running.
                     let transitioning = if let Some(start) = self.transition_start {
                         let progress = (start.elapsed().as_millis() as f32
@@ -1592,7 +1624,6 @@ SOURCE ({path}):
                     if !transitioning {
                         self.transition_from_content = data.display_content.clone();
                     }
-                    // Tab-style header bar
                     egui::Frame::NONE
                         .fill(C_RAISED)
                         .stroke(egui::Stroke::new(1.0, C_BORDER))
@@ -1686,7 +1717,6 @@ SOURCE ({path}):
     }
 
     fn render_terminal(&mut self, ui: &mut egui::Ui) {
-        // Terminal header bar
         egui::Frame::NONE
             .fill(C_RAISED)
             .stroke(egui::Stroke::new(1.0, C_BORDER))
@@ -1891,6 +1921,8 @@ SOURCE ({path}):
         let path = path.to_path_buf();
         let _ = tx.send(Message::SetState(AppState::Scanning));
         let _ = tx.send(Message::Log(format!("📁 Scanning {}...", path.display())));
+        // Use a plain OS thread — walkdir + fs::read_to_string are blocking and
+        // running them inside tokio::spawn would starve the async executor.
         std::thread::spawn(move || {
             if let Ok(entries) = walkdir::WalkDir::new(&path)
                 .into_iter()
@@ -2235,7 +2267,9 @@ SOURCE ({path}):
                 self.spawn_llm_error_fix(idx, content, path, errors);
             }
 
-            // --- Start animating; prefetch next file ---
+            // --- Start animating ---
+            // (Next-file prompting is triggered in the SetFileStatus message handler
+            // the moment this status is set, so it's already in flight by now.)
             FileStatus::ReadyToAnimate => {
                 // Hold here until the diffusion transition has finished so the
                 // animation always begins on a clean, fully-resolved frame.
@@ -2408,7 +2442,6 @@ SOURCE ({path}):
                         FileStatus::Error("analysis task timed out".into());
                     state.files[idx].analyzing_since = None;
                 } else {
-                    // Still waiting — come back soon to check the watchdog.
                     ctx.request_repaint_after(Duration::from_secs(30));
                 }
             }
@@ -2510,6 +2543,9 @@ impl eframe::App for RefactorApp {
 fn main() -> eframe::Result<()> {
     let _ = env_logger::builder().format_timestamp(None).try_init();
 
+    // eframe drives the event loop on the main thread, so we can't use
+    // #[tokio::main]. Instead, build the runtime manually and call rt.enter()
+    // so that tokio::spawn works from anywhere and on_exit can use block_on.
     let rt = tokio::runtime::Runtime::new().expect("Unable to create Tokio runtime");
     let _enter = rt.enter();
 
