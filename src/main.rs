@@ -4,8 +4,8 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -15,10 +15,19 @@ const DEFAULT_MODEL: &str = "qwen3.5-4b";
 const DEFAULT_CONTEXT: u32 = 30_000;
 const DELETE_INTERVAL_MS: u64 = 30;
 const TYPE_INTERVAL_MS: u64 = 30;
-const LINE_HEIGHT_PX: f32 = 18.0;
+const TRANSITION_MS: u64 = 500; // file-switch diffusion effect duration
+const LINE_HEIGHT_PX: f32 = 14.0; // matches monospace size 11.5 + line gap
 const SCROLL_LERP: f32 = 0.18;
 const SCROLL_SNAP_PX: f32 = 1.0;
 const MAX_FIX_ROUNDS: u32 = 3;
+const MAX_FILE_RETRIES: u8 = 2; // per-file retry attempts before skipping
+// Network timeouts (seconds)
+const TIMEOUT_MODEL_LIST_SECS: u64 = 10;  // GET /api/v1/models
+const TIMEOUT_MODEL_UNLOAD_SECS: u64 = 60; // POST /api/v1/models/unload
+const TIMEOUT_MODEL_LOAD_SECS: u64 = 300;  // POST /api/v1/models/load (large models take time)
+const TIMEOUT_LLM_CONNECT_SECS: u64 = 30;  // initial connection to LM Studio for chat completions
+const TIMEOUT_LLM_IDLE_SECS: u64 = 300;    // max silence between stream chunks before giving up
+const TIMEOUT_ANALYZING_SECS: u64 = 720;   // force Error if a file stays Analyzing this long (task crash guard)
 const MAX_LOG_LINES: usize = 500;
 /// Internal marker prefix for ASCII-art log lines (renders differently in the terminal).
 const ART_LINE: char = '\x01';
@@ -85,6 +94,8 @@ struct FileTask {
     fixes: Vec<Fix>,
     status: FileStatus,
     change_reason: String,
+    retry_count: u8,
+    analyzing_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -302,6 +313,43 @@ fn pick_ascii_art() -> &'static [&'static str] {
     ARTS[idx]
 }
 
+// --- DIFFUSION TRANSITION ---
+
+/// Cheap deterministic pseudo-random 0.0..1.0 from a character position.
+fn diffuse_hash(pos: usize) -> f32 {
+    let h = pos.wrapping_mul(2654435761_usize) ^ pos.wrapping_shr(16);
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+const DIFFUSE_NOISE: &[u8] = b"!@#$%^&*[]{}|<>/\\~+=_?;:.,'\"0123456789";
+
+fn diffuse_noise_char(pos: usize, t: f32) -> char {
+    let idx = pos.wrapping_add((t * 14.0) as usize) % DIFFUSE_NOISE.len();
+    DIFFUSE_NOISE[idx] as char
+}
+
+/// Renders a single frame of the file-switch diffusion effect.
+/// progress 0.0–0.45 : old content scatters to noise (low-hash positions go first)
+/// progress 0.45–1.0 : new content resolves from noise (low-hash positions appear first)
+fn compute_diffusion_frame(from: &str, to: &str, progress: f32) -> String {
+    if progress <= 0.0 { return from.to_string(); }
+    if progress >= 1.0 { return to.to_string(); }
+
+    if progress < 0.45 {
+        let p = progress / 0.45;
+        from.chars().enumerate().map(|(i, ch)| {
+            if ch == '\n' || ch.is_whitespace() { return ch; }
+            if diffuse_hash(i) < p { diffuse_noise_char(i, p) } else { ch }
+        }).collect()
+    } else {
+        let p = (progress - 0.45) / 0.55;
+        to.chars().enumerate().map(|(i, ch)| {
+            if ch == '\n' || ch.is_whitespace() { return ch; }
+            if diffuse_hash(i) < p { ch } else { diffuse_noise_char(i, p) }
+        }).collect()
+    }
+}
+
 // --- APP STRUCTURE ---
 struct RefactorApp {
     state: Arc<Mutex<SharedState>>,
@@ -315,6 +363,12 @@ struct RefactorApp {
     available_models: Vec<ModelInfo>,
     selected_model_idx: usize,
     context_length: u32,
+    // Cancels any in-flight LLM stream when set to true (pause / close folder).
+    llm_cancel: Arc<AtomicBool>,
+    // File-switch diffusion effect
+    transition_start: Option<Instant>,
+    transition_from_content: String,
+    last_shown_file_idx: Option<usize>,
 }
 
 enum Message {
@@ -344,6 +398,10 @@ impl RefactorApp {
             available_models: Vec::new(),
             selected_model_idx: 0,
             context_length: DEFAULT_CONTEXT,
+            llm_cancel: Arc::new(AtomicBool::new(false)),
+            transition_start: None,
+            transition_from_content: String::new(),
+            last_shown_file_idx: None,
         };
         app.spawn_fetch_models();
         app
@@ -429,7 +487,7 @@ impl RefactorApp {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(TIMEOUT_MODEL_LIST_SECS))
                 .build()
             {
                 Ok(c) => c,
@@ -511,7 +569,7 @@ impl RefactorApp {
         tokio::spawn(async move {
             let _ = tx.send(Message::Log(format!("⏏  Ejecting {}...", model_key)));
             let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(60))
+                .timeout(Duration::from_secs(TIMEOUT_MODEL_UNLOAD_SECS))
                 .build()
             {
                 Ok(c) => c,
@@ -559,7 +617,7 @@ impl RefactorApp {
             let _ = tx.send(Message::SetState(AppState::LoadingModel));
 
             let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
+                .timeout(Duration::from_secs(TIMEOUT_MODEL_LOAD_SECS))
                 .build()
             {
                 Ok(c) => c,
@@ -661,12 +719,11 @@ impl RefactorApp {
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let model_key = self.current_model_key();
+        let cancel = self.llm_cancel.clone();
         tokio::spawn(async move {
             let _ = tx.send(Message::Log(format!("⏳ Analyzing {}...", path)));
             let prompt = format!(
-                r#"You are a Rust optimization expert. Analyze the following Rust source file and identify specific improvements.
-
-Return ONLY a JSON object matching this exact schema — no markdown, no text outside the JSON:
+                r#"Answer ONLY in JSON matching this exact schema. Analyze the following Rust file and identify specific improvements:
 
 {{
   "fixes": [
@@ -678,17 +735,17 @@ Return ONLY a JSON object matching this exact schema — no markdown, no text ou
   ]
 }}
 
-Rules:
-- "old" MUST be an exact verbatim substring from the source — do not paraphrase or reformat it.
-- Keep each fix small and focused on one thing.
-- If there is nothing to improve, return {{ "fixes": [] }}.
-
 SOURCE ({path}):
 {content}"#,
                 path = path,
                 content = content
             );
-            Self::do_llm_request(tx, ctx, file_index, model_key, prompt).await;
+            if Self::do_llm_request(tx.clone(), ctx.clone(), file_index, model_key, prompt, cancel).await {
+                // Cancelled by pause — reset to Pending so it re-runs on resume.
+                let _ = tx.send(Message::Log("  ⏸ analysis cancelled (paused)".into()));
+                let _ = tx.send(Message::SetFileStatus(file_index, FileStatus::Pending));
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -702,6 +759,7 @@ SOURCE ({path}):
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let model_key = self.current_model_key();
+        let cancel = self.llm_cancel.clone();
         tokio::spawn(async move {
             let _ = tx.send(Message::Log(format!(
                 "🔧 Fixing compiler errors in {}...",
@@ -709,9 +767,7 @@ SOURCE ({path}):
             )));
             let error_text = errors.join("\n");
             let prompt = format!(
-                r#"You are a Rust compiler expert. The source file below failed to compile. Fix ALL the listed errors.
-
-Return ONLY a JSON object matching this exact schema — no markdown, no text outside the JSON:
+                r#"Answer ONLY in JSON matching this exact schema. Fix the compiler errors in this Rust file:
 
 {{
   "fixes": [
@@ -723,11 +779,6 @@ Return ONLY a JSON object matching this exact schema — no markdown, no text ou
   ]
 }}
 
-Rules:
-- "old" MUST be an exact verbatim substring from the source code.
-- Make targeted fixes for each compiler error.
-- If no changes are needed, return {{ "fixes": [] }}.
-
 COMPILER ERRORS:
 {error_text}
 
@@ -737,23 +788,33 @@ SOURCE ({path}):
                 path = path,
                 content = content
             );
-            Self::do_llm_request(tx, ctx, file_index, model_key, prompt).await;
+            if Self::do_llm_request(tx.clone(), ctx.clone(), file_index, model_key, prompt, cancel).await {
+                // Cancelled by pause — restore PendingErrorFix so it re-runs on resume.
+                let _ = tx.send(Message::Log("  ⏸ error-fix cancelled (paused)".into()));
+                let _ = tx.send(Message::SetFileStatus(
+                    file_index,
+                    FileStatus::PendingErrorFix(errors),
+                ));
+                ctx.request_repaint();
+            }
         });
     }
 
     /// Shared HTTP logic — uses SSE streaming so the terminal shows live progress.
+    /// Returns `true` if the stream was cancelled (pause), `false` if it completed normally.
     async fn do_llm_request(
         tx: mpsc::UnboundedSender<Message>,
         ctx: egui::Context,
         file_index: usize,
         model_key: String,
         prompt: String,
-    ) {
+        cancel: Arc<AtomicBool>,
+    ) -> bool {
         let _ = tx.send(Message::SetFileStatus(file_index, FileStatus::Analyzing));
         let request_start = Instant::now();
 
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(TIMEOUT_LLM_CONNECT_SECS))
             .build()
         {
             Ok(c) => c,
@@ -763,7 +824,7 @@ SOURCE ({path}):
                     FileStatus::Error(e.to_string()),
                 ));
                 ctx.request_repaint();
-                return;
+                return false;
             }
         };
 
@@ -794,7 +855,7 @@ SOURCE ({path}):
                     FileStatus::Error(format!("HTTP {}: {}", status, snippet)),
                 ));
                 ctx.request_repaint();
-                return;
+                return false;
             }
             Err(e) => {
                 let _ = tx.send(Message::SetFileStatus(
@@ -802,7 +863,7 @@ SOURCE ({path}):
                     FileStatus::Error(e.to_string()),
                 ));
                 ctx.request_repaint();
-                return;
+                return false;
             }
         };
 
@@ -818,17 +879,36 @@ SOURCE ({path}):
         let mut first_token_logged = false;
         let mut last_reported_tokens: u64 = 0;
 
+        let idle_timeout = Duration::from_secs(TIMEOUT_LLM_IDLE_SECS);
         'stream: loop {
-            let bytes = match resp.chunk().await {
-                Ok(Some(b)) => b,
-                Ok(None) => break 'stream, // stream finished
-                Err(e) => {
+            // Check cancel flag before every chunk — set by pause button.
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+
+            let chunk = tokio::time::timeout(idle_timeout, resp.chunk()).await;
+            let bytes = match chunk {
+                Ok(Ok(Some(b))) => b,
+                Ok(Ok(None)) => break 'stream, // stream finished normally
+                Ok(Err(e)) => {
                     let _ = tx.send(Message::SetFileStatus(
                         file_index,
                         FileStatus::Error(format!("Stream error: {}", e)),
                     ));
                     ctx.request_repaint();
-                    return;
+                    return false;
+                }
+                Err(_) => {
+                    // No data received for TIMEOUT_LLM_IDLE_SECS — model stalled
+                    let _ = tx.send(Message::SetFileStatus(
+                        file_index,
+                        FileStatus::Error(format!(
+                            "Stream idle for {}s — model may have stalled",
+                            TIMEOUT_LLM_IDLE_SECS
+                        )),
+                    ));
+                    ctx.request_repaint();
+                    return false;
                 }
             };
 
@@ -955,19 +1035,24 @@ SOURCE ({path}):
         }
 
         ctx.request_repaint();
+        false
     }
 
     fn spawn_cargo_check(&self) {
         let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
             let _ = tx.send(Message::Log("🔎 Running cargo check...".into()));
+            ctx.request_repaint();
             let root = state.lock().unwrap_or_else(|e| e.into_inner()).root_path.clone();
             if let Some(path) = root {
-                match Command::new("cargo")
+                // Use tokio's async process so we don't block a worker thread.
+                match tokio::process::Command::new("cargo")
                     .arg("check")
                     .current_dir(&path)
                     .output()
+                    .await
                 {
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1001,6 +1086,7 @@ SOURCE ({path}):
                             )));
                         }
                         let _ = tx.send(Message::CargoCheckResult(errors));
+                        ctx.request_repaint();
                     }
                     Err(e) => {
                         let _ = tx.send(Message::Log(format!(
@@ -1008,6 +1094,7 @@ SOURCE ({path}):
                             e
                         )));
                         let _ = tx.send(Message::SetState(AppState::Finished));
+                        ctx.request_repaint();
                     }
                 }
             }
@@ -1105,9 +1192,9 @@ SOURCE ({path}):
             let current_label = {
                 let m = &self.available_models[self.selected_model_idx];
                 if m.is_loaded {
-                    format!("● {}", m.display_name)
+                    format!("* {}", m.display_name)
                 } else {
-                    format!("○ {}", m.display_name)
+                    format!("- {}", m.display_name)
                 }
             };
 
@@ -1122,9 +1209,9 @@ SOURCE ({path}):
                 .show_ui(ui, |ui| {
                     for (i, m) in self.available_models.iter().enumerate() {
                         let (dot, dot_color) = if m.is_loaded {
-                            ("●", C_GREEN)
+                            ("*", C_GREEN)
                         } else {
-                            ("○", C_TEXT_MUTED)
+                            ("-", C_TEXT_MUTED)
                         };
                         let ctx_k = m.max_context_length / 1000;
                         ui.horizontal(|ui| {
@@ -1218,9 +1305,10 @@ SOURCE ({path}):
                     };
                     if ui.add_sized([load_width, 26.0], load_btn).clicked() {
                         let ctx = self.context_length;
-                        // Eject the other loaded model (if any); reload is handled by LM Studio
+                        // Always eject before loading: either the same model (reload)
+                        // or a different model that happens to be loaded.
                         let eject = if selected_loaded {
-                            None // reloading same model — LM Studio handles it
+                            Some((selected_key.clone(), selected_instance_id.clone()))
                         } else {
                             other_loaded
                         };
@@ -1306,9 +1394,13 @@ SOURCE ({path}):
 
                     if has_files
                         && (app_state == AppState::Paused
-                            || app_state == AppState::Processing)
+                            || app_state == AppState::Processing
+                            || app_state == AppState::CargoChecking
+                            || matches!(app_state, AppState::FixingErrors(_)))
                     {
-                        let is_processing = app_state == AppState::Processing;
+                        let is_processing = app_state == AppState::Processing
+                            || app_state == AppState::CargoChecking
+                            || matches!(app_state, AppState::FixingErrors(_));
                         let (btn_text, bg, fg) = if is_processing {
                             ("⏸  Pause", C_RED, C_TEXT)
                         } else {
@@ -1324,8 +1416,12 @@ SOURCE ({path}):
                         .corner_radius(4);
                         if ui.add_sized([ui.available_width(), 26.0], btn).clicked() {
                             let next = if is_processing {
+                                // Cancel any active LLM stream immediately.
+                                self.llm_cancel.store(true, Ordering::Relaxed);
                                 AppState::Paused
                             } else {
+                                // Allow new LLM streams to start.
+                                self.llm_cancel.store(false, Ordering::Relaxed);
                                 AppState::Processing
                             };
                             let _ = self.tx.send(Message::SetState(next));
@@ -1444,15 +1540,58 @@ SOURCE ({path}):
             .corner_radius(6)
             .show(ui, |ui| {
                 // Compute display data inside a scoped lock — release before any &mut self use.
-                let render_data: Option<EditorRenderData> = {
+                let render_data: Option<(EditorRenderData, usize)> = {
                     let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state
-                        .files
-                        .get(state.current_file_index)
-                        .map(build_editor_data)
+                    // Fall back to the last file if the index has advanced past the end
+                    // (e.g. while cargo check is running after the final file).
+                    let shown_idx = if state.files.is_empty() {
+                        None
+                    } else if state.current_file_index < state.files.len() {
+                        Some(state.current_file_index)
+                    } else {
+                        Some(state.files.len() - 1)
+                    };
+                    shown_idx.map(|i| (build_editor_data(&state.files[i]), i))
                 };
 
-                if let Some(data) = render_data {
+                if let Some((mut data, shown_idx)) = render_data {
+                    // --- Diffusion transition between files ---
+                    let file_changed = self.last_shown_file_idx
+                        .map_or(false, |prev| prev != shown_idx);
+                    if file_changed {
+                        // Lerp scroll to top over the diffusion window so the
+                        // transition feels smooth rather than snapping mid-edit.
+                        self.scroll_target_y = 0.0;
+                        self.transition_start = Some(Instant::now());
+                    }
+                    self.last_shown_file_idx = Some(shown_idx);
+
+
+                    // Override display_content while the transition is running.
+                    let transitioning = if let Some(start) = self.transition_start {
+                        let progress = (start.elapsed().as_millis() as f32
+                            / TRANSITION_MS as f32)
+                            .min(1.0);
+                        if progress < 1.0 {
+                            data.display_content = compute_diffusion_frame(
+                                &self.transition_from_content,
+                                &data.display_content,
+                                progress,
+                            );
+                            ui.ctx().request_repaint();
+                            true
+                        } else {
+                            self.transition_start = None;
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    // Keep from_content up-to-date when nothing is active
+                    // so the next switch dissolves from the correct frame.
+                    if !transitioning {
+                        self.transition_from_content = data.display_content.clone();
+                    }
                     // Tab-style header bar
                     egui::Frame::NONE
                         .fill(C_RAISED)
@@ -1479,12 +1618,14 @@ SOURCE ({path}):
                             );
                         });
 
-                    // Code area
+                    // Code area — stretch dark bg to fill the remaining panel height
+                    let code_area_height = ui.available_height();
                     egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(10, 14, 20))
                         .inner_margin(12.0)
                         .show(ui, |ui| {
-                            // Smooth scroll
+                            ui.set_min_height(code_area_height - 24.0);
+                            // Scroll-to-cursor during animation.
                             if data.is_animating {
                                 let cursor_line = data
                                     .display_content
@@ -1497,6 +1638,7 @@ SOURCE ({path}):
                                     (cursor_line * LINE_HEIGHT_PX - 200.0).max(0.0);
                             }
 
+                            // Lerp toward target every frame.
                             let delta = self.scroll_target_y - self.editor_scroll_y;
                             if delta.abs() > SCROLL_SNAP_PX {
                                 self.editor_scroll_y += delta * SCROLL_LERP;
@@ -1505,25 +1647,31 @@ SOURCE ({path}):
                                 self.editor_scroll_y = self.scroll_target_y;
                             }
 
-                            let mut sa = egui::ScrollArea::vertical();
-                            if data.is_animating {
-                                sa = sa.scroll_offset(egui::Vec2::new(
-                                    0.0,
-                                    self.editor_scroll_y,
-                                ));
-                            }
-
+                            // Always pass our scroll position so egui's internal state
+                            // never diverges from ours. Use a stable id_salt so egui
+                            // doesn't lose its state between frames.
                             let mut content = data.display_content;
-                            sa.show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut content)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
-                                        .code_editor()
-                                        .interactive(false)
-                                        .text_color(C_TEXT),
-                                );
-                            });
+                            let scroll_out = egui::ScrollArea::vertical()
+                                .id_salt("editor")
+                                .scroll_offset(egui::Vec2::new(0.0, self.editor_scroll_y))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut content)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY)
+                                            .code_editor()
+                                            .interactive(false)
+                                            .text_color(C_TEXT)
+                                            .frame(false),
+                                    );
+                                });
+
+                            // When not animating, follow the user's scroll so we stay
+                            // in sync and don't snap when animation resumes.
+                            if !data.is_animating {
+                                self.editor_scroll_y = scroll_out.state.offset.y;
+                                self.scroll_target_y = self.editor_scroll_y;
+                            }
                         });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -1551,6 +1699,19 @@ SOURCE ({path}):
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                // Build clipboard text up front (owned) so the lock stays immutable.
+                let copy_text: String = state
+                    .logs
+                    .iter()
+                    .map(|l| {
+                        if l.starts_with(ART_LINE) {
+                            &l[ART_LINE.len_utf8()..]
+                        } else {
+                            l.as_str()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("TERMINAL")
@@ -1561,42 +1722,61 @@ SOURCE ({path}):
                     );
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| match &state.app_state {
-                            AppState::Finished if !state.cargo_errors.is_empty() => {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "x  {} issue(s) remain",
-                                        state
-                                            .cargo_errors
-                                            .iter()
-                                            .filter(|l| l.trim_start().starts_with("error["))
-                                            .count()
-                                    ))
-                                    .color(C_RED)
-                                    .size(11.0)
-                                    .family(egui::FontFamily::Monospace),
-                                );
+                        |ui| {
+                            // Copy button — rightmost item in the header bar.
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("copy")
+                                            .color(C_ACCENT)
+                                            .size(10.0)
+                                            .family(egui::FontFamily::Monospace),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Copy terminal output to clipboard")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(copy_text);
                             }
-                            AppState::Finished => {
-                                ui.label(
-                                    egui::RichText::new("+  done")
-                                        .color(C_GREEN)
+                            ui.add_space(8.0);
+                            match &state.app_state {
+                                AppState::Finished if !state.cargo_errors.is_empty() => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "x  {} issue(s) remain",
+                                            state
+                                                .cargo_errors
+                                                .iter()
+                                                .filter(|l| l.trim_start().starts_with("error["))
+                                                .count()
+                                        ))
+                                        .color(C_RED)
                                         .size(11.0)
                                         .family(egui::FontFamily::Monospace),
-                                );
+                                    );
+                                }
+                                AppState::Finished => {
+                                    ui.label(
+                                        egui::RichText::new("+  done")
+                                            .color(C_GREEN)
+                                            .size(11.0)
+                                            .family(egui::FontFamily::Monospace),
+                                    );
+                                }
+                                AppState::FixingErrors(n) => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "~  fix round {}/{}",
+                                            n, MAX_FIX_ROUNDS
+                                        ))
+                                        .color(C_ORANGE)
+                                        .size(11.0)
+                                        .family(egui::FontFamily::Monospace),
+                                    );
+                                }
+                                _ => {}
                             }
-                            AppState::FixingErrors(n) => {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "~  fix round {}/{}",
-                                        n, MAX_FIX_ROUNDS
-                                    ))
-                                    .color(C_ORANGE)
-                                    .size(11.0)
-                                    .family(egui::FontFamily::Monospace),
-                                );
-                            }
-                            _ => {}
                         },
                     );
                 });
@@ -1697,8 +1877,13 @@ SOURCE ({path}):
         state.cargo_check_round = 0;
         state.push_log("📁 Folder closed.");
         drop(state);
+        self.llm_cancel.store(false, Ordering::Relaxed);
         self.editor_scroll_y = 0.0;
         self.scroll_target_y = 0.0;
+        self.transition_start = None;
+
+        self.transition_from_content = String::new();
+        self.last_shown_file_idx = None;
     }
 
     fn scan_folder(&self, path: &Path) {
@@ -1782,7 +1967,12 @@ SOURCE ({path}):
                         }
                     }
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.app_state = AppState::Idle;
+                    // Only reset to Idle if no folder is open — if the user opened
+                    // a folder while the model was loading, keep the Paused state
+                    // so the Start button stays visible.
+                    if state.root_path.is_none() {
+                        state.app_state = AppState::Idle;
+                    }
                     state.push_log(format!("✅ Model '{}' ready", key));
                     drop(state);
                     // Re-fetch model list to get fresh instance_id for the loaded model
@@ -1806,12 +1996,41 @@ SOURCE ({path}):
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     match msg {
                         Message::Log(log) => state.push_log(log),
-                        Message::SetState(s) => state.app_state = s,
+                        Message::SetState(s) => {
+                            // Ignore file-pipeline states from stale tasks if the
+                            // folder has been closed since they were spawned.
+                            let is_pipeline_state = matches!(
+                                s,
+                                AppState::Processing
+                                    | AppState::FixingErrors(_)
+                                    | AppState::CargoChecking
+                                    | AppState::Scanning
+                            );
+                            if !is_pipeline_state || state.root_path.is_some() {
+                                // When resuming from Paused to Processing, check if we
+                                // actually have error-fix files queued — if so, restore
+                                // the correct FixingErrors(round) state instead.
+                                let resolved = if s == AppState::Processing
+                                    && state.app_state == AppState::Paused
+                                    && state.files.iter().any(|f| {
+                                        matches!(f.status, FileStatus::PendingErrorFix(_))
+                                    })
+                                {
+                                    AppState::FixingErrors(state.cargo_check_round)
+                                } else {
+                                    s
+                                };
+                                state.app_state = resolved;
+                            }
+                        }
                         Message::AddFile(path, content) => {
                             if state.root_path.is_none() {
                                 state.root_path =
                                     path.parent().map(|p| p.to_path_buf());
                             }
+                            // Normalize CRLF → LF so that LLM-returned `old` substrings
+                            // (which are always LF) match the working content on Windows.
+                            let content = content.replace("\r\n", "\n");
                             state.files.push(FileTask {
                                 path,
                                 original_content: content.clone(),
@@ -1819,10 +2038,17 @@ SOURCE ({path}):
                                 fixes: Vec::new(),
                                 status: FileStatus::Pending,
                                 change_reason: "Awaiting analysis...".into(),
+                                retry_count: 0,
+                                analyzing_since: None,
                             });
                         }
-                        Message::UpdateFixes(idx, fixes) => {
+                        Message::UpdateFixes(idx, mut fixes) => {
                             if let Some(file) = state.files.get_mut(idx) {
+                                // Normalize line endings in LLM-returned fix strings.
+                                for f in &mut fixes {
+                                    f.old = f.old.replace("\r\n", "\n");
+                                    f.new = f.new.replace("\r\n", "\n");
+                                }
                                 file.change_reason = fixes
                                     .first()
                                     .map(|f| f.explanation.clone())
@@ -1832,7 +2058,50 @@ SOURCE ({path}):
                         }
                         Message::SetFileStatus(idx, status) => {
                             if let Some(file) = state.files.get_mut(idx) {
-                                file.status = status;
+                                file.analyzing_since = None;
+                                file.status = status.clone();
+                            }
+                            // As soon as a response is queued, immediately start
+                            // prompting the next pending file — no waiting for
+                            // animation to finish.
+                            if matches!(status, FileStatus::ReadyToAnimate) {
+                                let next = (idx + 1..state.files.len()).find(|&i| {
+                                    matches!(
+                                        state.files[i].status,
+                                        FileStatus::Pending | FileStatus::PendingErrorFix(_)
+                                    )
+                                });
+                                if let Some(next_idx) = next {
+                                    let errors =
+                                        if let FileStatus::PendingErrorFix(e) =
+                                            &state.files[next_idx].status
+                                        {
+                                            Some(e.clone())
+                                        } else {
+                                            None
+                                        };
+                                    let next_content = if errors.is_some() {
+                                        state.files[next_idx].working_content.clone()
+                                    } else {
+                                        state.files[next_idx].original_content.clone()
+                                    };
+                                    let next_path =
+                                        state.files[next_idx].path.display().to_string();
+                                    state.files[next_idx].status = FileStatus::Analyzing;
+                                    state.files[next_idx].analyzing_since =
+                                        Some(Instant::now());
+                                    drop(state);
+                                    if let Some(errs) = errors {
+                                        self.spawn_llm_error_fix(
+                                            next_idx, next_content, next_path, errs,
+                                        );
+                                    } else {
+                                        self.spawn_llm_analysis(
+                                            next_idx, next_content, next_path,
+                                        );
+                                    }
+                                    continue;
+                                }
                             }
                         }
                         Message::CargoCheckResult(errors) => {
@@ -1879,17 +2148,21 @@ SOURCE ({path}):
                                     if is_errored {
                                         file.status =
                                             FileStatus::PendingErrorFix(errors.clone());
+                                        file.retry_count = 0;
                                         requeued += 1;
                                     }
                                 }
 
                                 if requeued > 0 {
                                     state.current_file_index = 0;
-                                    state.app_state =
-                                        AppState::FixingErrors(round);
+                                    let currently_paused = state.app_state == AppState::Paused;
+                                    if !currently_paused {
+                                        state.app_state = AppState::FixingErrors(round);
+                                    }
                                     state.push_log(format!(
-                                        "🔧 Fix round {}/{}: re-analyzing {} file(s)...",
-                                        round, MAX_FIX_ROUNDS, requeued
+                                        "🔧 Fix round {}/{}: re-analyzing {} file(s){}...",
+                                        round, MAX_FIX_ROUNDS, requeued,
+                                        if currently_paused { " (paused)" } else { "" }
                                     ));
                                 } else {
                                     // Couldn't match errors to files
@@ -1945,6 +2218,7 @@ SOURCE ({path}):
             // --- Kick off analysis ---
             FileStatus::Pending => {
                 state.files[idx].status = FileStatus::Analyzing;
+                state.files[idx].analyzing_since = Some(Instant::now());
                 let content = state.files[idx].original_content.clone();
                 let path = state.files[idx].path.display().to_string();
                 drop(state);
@@ -1954,6 +2228,7 @@ SOURCE ({path}):
             FileStatus::PendingErrorFix(errors) => {
                 let errors = errors.clone();
                 state.files[idx].status = FileStatus::Analyzing;
+                state.files[idx].analyzing_since = Some(Instant::now());
                 let content = state.files[idx].working_content.clone();
                 let path = state.files[idx].path.display().to_string();
                 drop(state);
@@ -1962,6 +2237,31 @@ SOURCE ({path}):
 
             // --- Start animating; prefetch next file ---
             FileStatus::ReadyToAnimate => {
+                // Hold here until the diffusion transition has finished so the
+                // animation always begins on a clean, fully-resolved frame.
+                // Safety: force-clear if stuck beyond the transition budget.
+                if let Some(ts) = self.transition_start {
+                    if ts.elapsed() > Duration::from_millis(TRANSITION_MS + 500) {
+                        self.transition_start = None;
+                    }
+                }
+                if self.transition_start.is_some() {
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                    return;
+                }
+
+                // Drop any fixes whose old text no longer exists in the file.
+                let content = state.files[idx].working_content.clone();
+                let fixes_before = state.files[idx].fixes.len();
+                state.files[idx].fixes.retain(|f| content.contains(f.old.as_str()));
+                let fixes_dropped = fixes_before - state.files[idx].fixes.len();
+                if fixes_dropped > 0 {
+                    state.push_log(format!(
+                        "  ! {} fix(es) skipped — old text not found in file (LLM drift?)",
+                        fixes_dropped
+                    ));
+                }
+
                 let has_fixes = !state.files[idx].fixes.is_empty();
                 if has_fixes {
                     let chars = state.files[idx].fixes[0].old.chars().count();
@@ -1977,43 +2277,6 @@ SOURCE ({path}):
                     state.current_file_index += 1;
                 }
 
-                // Prefetch: find the next file still needing analysis
-                let next = (idx + 1..state.files.len()).find(|&i| {
-                    matches!(
-                        state.files[i].status,
-                        FileStatus::Pending | FileStatus::PendingErrorFix(_)
-                    )
-                });
-
-                if let Some(next_idx) = next {
-                    let is_err_fix = matches!(
-                        &state.files[next_idx].status,
-                        FileStatus::PendingErrorFix(_)
-                    );
-                    let errors = if let FileStatus::PendingErrorFix(e) =
-                        &state.files[next_idx].status
-                    {
-                        Some(e.clone())
-                    } else {
-                        None
-                    };
-                    let next_content = if is_err_fix {
-                        state.files[next_idx].working_content.clone()
-                    } else {
-                        state.files[next_idx].original_content.clone()
-                    };
-                    let next_path =
-                        state.files[next_idx].path.display().to_string();
-                    // Mark analyzing immediately so we don't double-trigger
-                    state.files[next_idx].status = FileStatus::Analyzing;
-                    drop(state);
-                    if let Some(errs) = errors {
-                        self.spawn_llm_error_fix(next_idx, next_content, next_path, errs);
-                    } else {
-                        self.spawn_llm_analysis(next_idx, next_content, next_path);
-                    }
-                    return;
-                }
             }
 
             // --- Advance animation one char per tick ---
@@ -2043,15 +2306,25 @@ SOURCE ({path}):
                         };
                     }
                     AnimPhase::Typing(typed) => {
-                        let total =
-                            state.files[idx].fixes[fix_index].new.chars().count();
+                        let total = state.files[idx]
+                            .fixes
+                            .get(fix_index)
+                            .map_or(0, |f| f.new.chars().count());
                         if typed >= total {
-                            // Commit this fix
+                            // Commit this fix — but only if old text is still present.
+                            // A prior fix in this batch may have shifted/removed it.
                             let fix = state.files[idx].fixes[fix_index].clone();
-                            let updated = state.files[idx]
-                                .working_content
-                                .replacen(&fix.old, &fix.new, 1);
-                            state.files[idx].working_content = updated;
+                            if state.files[idx].working_content.contains(fix.old.as_str()) {
+                                let updated = state.files[idx]
+                                    .working_content
+                                    .replacen(&fix.old, &fix.new, 1);
+                                state.files[idx].working_content = updated;
+                            } else {
+                                state.push_log(format!(
+                                    "  ! fix {} skipped at apply time — old text no longer in file (prior fix collision?)",
+                                    fix_index + 1
+                                ));
+                            }
 
                             let next_fix = fix_index + 1;
                             if next_fix < fix_count {
@@ -2066,12 +2339,13 @@ SOURCE ({path}):
                                 let path = state.files[idx].path.clone();
                                 let final_content =
                                     state.files[idx].working_content.clone();
-                                let write_ok = std::fs::write(&path, &final_content).is_ok();
-                                state.files[idx].status = if write_ok {
-                                    FileStatus::Completed
-                                } else {
-                                    FileStatus::Error("Write failed".into())
-                                };
+                                state.files[idx].status =
+                                    match std::fs::write(&path, &final_content) {
+                                        Ok(()) => FileStatus::Completed,
+                                        Err(e) => FileStatus::Error(format!("Write failed: {}", e)),
+                                    };
+                                let write_ok =
+                                    matches!(state.files[idx].status, FileStatus::Completed);
                                 state.current_file_index += 1;
                                 // Easter egg: drop a random ASCII art into the terminal
                                 if write_ok {
@@ -2092,7 +2366,54 @@ SOURCE ({path}):
                 }
             }
 
-            _ => {} // Analyzing, Error — wait for messages
+            FileStatus::Error(msg) => {
+                let name = state.files[idx]
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                if state.files[idx].retry_count < MAX_FILE_RETRIES {
+                    state.files[idx].retry_count += 1;
+                    let attempt = state.files[idx].retry_count;
+                    state.push_log(format!(
+                        "  ~ retrying {} ({}/{}) — {}",
+                        name, attempt, MAX_FILE_RETRIES,
+                        msg.chars().take(80).collect::<String>()
+                    ));
+                    // Clear stale fixes and reset to Pending for a fresh attempt
+                    state.files[idx].fixes.clear();
+                    state.files[idx].status = FileStatus::Pending;
+                } else {
+                    state.push_log(format!(
+                        "  x skipping {} after {} failed attempt(s): {}",
+                        name, MAX_FILE_RETRIES,
+                        msg.chars().take(120).collect::<String>()
+                    ));
+                    state.current_file_index += 1;
+                }
+            }
+
+            FileStatus::Analyzing => {
+                // Watchdog: if the tokio task crashed silently the file would be
+                // stuck here forever. Force it to Error so the retry logic unblocks.
+                let timed_out = state.files[idx]
+                    .analyzing_since
+                    .map_or(false, |t| {
+                        t.elapsed() > Duration::from_secs(TIMEOUT_ANALYZING_SECS)
+                    });
+                if timed_out {
+                    state.files[idx].status =
+                        FileStatus::Error("analysis task timed out".into());
+                    state.files[idx].analyzing_since = None;
+                } else {
+                    // Still waiting — come back soon to check the watchdog.
+                    ctx.request_repaint_after(Duration::from_secs(30));
+                }
+            }
+
+            _ => {}
         }
     }
 }
@@ -2166,15 +2487,12 @@ impl eframe::App for RefactorApp {
             } else {
                 serde_json::json!({ "instance_id": key })
             };
-            // Spin up a tiny single-thread runtime just for this shutdown request.
-            // We can't reuse the main tokio runtime here (it's already being torn down).
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                let _ = rt.block_on(async {
+            // The main tokio runtime is still alive (rt.enter() guard in main()),
+            // so we reuse its handle rather than creating a new runtime.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let _ = handle.block_on(async {
                     if let Ok(client) = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(10))
+                        .timeout(Duration::from_secs(TIMEOUT_MODEL_UNLOAD_SECS))
                         .build()
                     {
                         let _ = client
@@ -2203,7 +2521,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Rust Refactor Agent",
+        "Rust Optimizer",
         native_options,
         Box::new(|cc| Ok(Box::new(RefactorApp::new(cc)))),
     )

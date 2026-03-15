@@ -31,11 +31,12 @@ If your machine is roughly in this ballpark — or better — this will work for
 1. **Connects to LM Studio** running locally on `127.0.0.1:1234`
 2. **Scans a Rust project** folder and queues every `.rs` file
 3. **Sends each file to the LLM** with a structured prompt asking for targeted refactor suggestions in JSON
-4. **Streams the response live** to a terminal panel with token counts and timing stats
+4. **Streams the response live** to a terminal panel with real-time token counts, tok/s rate, and timing stats
 5. **Animates the edits** into the code editor — deleting old text, typing in the new — like someone's actually in there
-6. **Writes the changes to disk** and runs `cargo check` to catch any LLM-introduced mistakes
+6. **Writes the changes to disk** and runs `cargo check` asynchronously to catch any LLM-introduced mistakes
 7. **Re-queues broken files** for up to 3 rounds of auto-fix if the compiler complains
-8. **Drops ASCII art** in the terminal after each successful edit, because productivity tools need more personality
+8. **Ejects the loaded model** from LM Studio automatically on app exit so it doesn't sit in RAM when you're done
+9. **Drops ASCII art** in the terminal after each successful edit, because productivity tools need more personality
 
 ---
 
@@ -62,6 +63,32 @@ That's genuinely all of it.
 
 ---
 
+## tuning
+
+Everything worth tweaking lives in the `// --- CONFIGURATION ---` block at the top of `src/main.rs`:
+
+```rust
+const LM_STUDIO_BASE: &str = "http://127.0.0.1:1234"; // change if LM Studio is on another port
+const DEFAULT_MODEL: &str   = "qwen3.5-4b";            // pre-selected model on startup
+const DEFAULT_CONTEXT: u32  = 30_000;                  // default context window (tokens)
+const MAX_FIX_ROUNDS: u32   = 3;                       // how many cargo check + fix cycles before giving up
+
+// animation speed
+const DELETE_INTERVAL_MS: u64 = 30; // ms per character deleted
+const TYPE_INTERVAL_MS:   u64 = 30; // ms per character typed
+
+// network timeouts
+const TIMEOUT_MODEL_LIST_SECS:   u64 = 10;  // fetching the model list
+const TIMEOUT_MODEL_UNLOAD_SECS: u64 = 60;  // ejecting a model
+const TIMEOUT_MODEL_LOAD_SECS:   u64 = 300; // loading a model (large ones take time)
+const TIMEOUT_LLM_CONNECT_SECS:  u64 = 30;  // initial connection to LM Studio
+const TIMEOUT_LLM_IDLE_SECS:     u64 = 120; // max silence between stream chunks before giving up
+```
+
+The streaming timeout (`TIMEOUT_LLM_IDLE_SECS`) is an *idle* timeout — it resets on every received chunk, so long responses on slow hardware will never time out as long as tokens keep arriving. Only fires if the model completely stalls.
+
+---
+
 ## what this is not
 
 - Production-ready (it's a PoC, see title)
@@ -82,8 +109,8 @@ Is it as good as Claude doing the same thing? No. Is it free, private, and runs 
 ## built with
 
 - [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe) — immediate-mode GUI
-- [tokio](https://tokio.rs/) — async runtime
-- [reqwest](https://github.com/seanmonstar/reqwest) — HTTP client for LM Studio API
+- [tokio](https://tokio.rs/) — async runtime with async process and time support
+- [reqwest](https://github.com/seanmonstar/reqwest) — HTTP client for LM Studio API (SSE streaming)
 - [LM Studio](https://lmstudio.ai/) — local LLM server
 - Rust, obviously
 
