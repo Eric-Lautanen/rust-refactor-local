@@ -5,7 +5,7 @@
 ---
 
 > [!WARNING]
-> **This tool writes directly to your files with no undo.** A bad model or a bad prompt will gleefully corrupt your entire codebase. **Back up your work or run it inside a git repo before you start.** You have been warned.
+> **This tool writes directly to your files.** A bad model or a bad prompt will gleefully corrupt your entire codebase. Each file gets a backup in a temp directory on scan, and a `↩` undo button appears per file after editing — but don't rely on that as your only safety net. **Back up your work or run it inside a git repo before you start.** You have been warned.
 
 ---
 
@@ -124,10 +124,12 @@ cargo run --release
 ```
 
 1. The app opens and connects to LM Studio automatically
-2. Pick your loaded model from the dropdown (or load one with the Load button)
+2. Pick your loaded model from the dropdown (or load one with the **⚡ Load** button)
 3. Click **Open Folder** and select the folder you want to process
 4. Optionally edit the **PROMPT** to tell the model what to do
 5. Hit **▶ Start**
+
+You can open a folder and load a model in either order — the app handles both.
 
 That's genuinely all of it.
 
@@ -145,9 +147,10 @@ That's genuinely all of it.
 8. **Writes the changes to disk** and runs `cargo check` asynchronously if Rust files are present
 9. **Re-queues broken files** for up to 3 rounds of auto-fix if the compiler complains
 10. **Retries failed files** up to 2 times before skipping, without stalling the rest of the queue
-11. **Removes individual files** from the queue with the `-` button before or after processing
-12. **Ejects the loaded model** from LM Studio automatically on app exit so it doesn't sit in RAM when you're done
-13. **Drops ASCII art** in the terminal after each successful edit, because productivity tools need more personality
+11. **Per-file queue controls** — `×` removes a file before or after processing; `↩` restores the original from the temp backup after editing
+12. **Backs up every file** to a temp directory on scan so `↩` undo works even if something goes sideways
+13. **Ejects the loaded model** from LM Studio automatically on app exit so it doesn't sit in RAM when you're done
+14. **Drops ASCII art** in the terminal after each successful edit, because productivity tools need more personality
 
 ---
 
