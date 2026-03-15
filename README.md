@@ -60,21 +60,25 @@ LM Studio runs the AI model locally on your machine. Current version as of March
 
 1. Open LM Studio and go to the **Discover** tab
 2. Search for a model (see recommendations below)
-3. Pick a quantization — **Q4_K_M** is the sweet spot for quality vs. speed
+3. Pick a quantization — **Q4_K_M** is the sweet spot for quality vs. speed; **Q5_K_M** if you have headroom to spare
 4. Click Download and wait
 
-### recommended models for 16 GB RAM
+### recommended models for 16 GB RAM (2026)
 
 | Model | Size | Notes |
 |---|---|---|
-| Qwen2.5-Coder 4B | ~3 GB | Fast, great at code, the default pick |
-| Qwen3 4B | ~3 GB | Stronger reasoning, slightly slower |
-| Qwen3-Coder 7B | ~5 GB | Best code quality if you have headroom |
-| DeepSeek-R1 8B distill | ~5 GB | Excellent for debugging and tricky logic |
-| Llama 3.3 8B | ~5 GB | Solid all-rounder |
+| Qwen3.5 9B Q4_K_M | ~6 GB | Strong all-around pick for 16 GB — what this app was tested with |
+| Qwen3.5 4B Q4_K_M | ~3 GB | Fast and light — also tested with this app. Good if running other things simultaneously |
+| Qwen3 8B Q4_K_M | ~5–6 GB | Best all-around for coding + reasoning. Thinking mode for debugging, fast mode for edits |
+| Qwen3 4B 2507 Q4_K_M | ~3 GB | Solid lightweight option, punches above its weight |
+| Qwen2.5-Coder 7B Q4_K_M | ~5 GB | Highest code benchmark scores under 10B — great for pure code tasks |
+| Phi-4-mini Q4_K_M | ~3 GB | Microsoft's 3.8B with reasoning quality well above its size |
+| Gemma 3 12B Q4_K_M | ~8 GB | Best general-purpose — strong at writing/docs, not code-specialized |
 
 ### for 8 GB RAM
-Stick to 3B–4B models (Qwen 4B, Phi-4-mini). Anything larger will be very slow or won't fit.
+Stick to **Qwen3 4B** or **Phi-4-mini** — both load under 3 GB and leave room to breathe. Anything 7B+ risks swapping under longer contexts.
+
+> A note on Llama 4: impressive model, but the smallest variant is a 109B MoE — it doesn't run on consumer RAM without a serious GPU. Skip it for now.
 
 Smaller models get flaky with the JSON schema this app requires. If responses keep failing, try a larger or smarter model.
 
@@ -118,7 +122,7 @@ Or skip this step and use the **Load** button inside this app — it will call t
 ## step 4 — run this app
 
 ```bash
-git clone <this repo>
+git clone https://github.com/Eric-Lautanen/rustoptimizer
 cd rustoptimizer
 cargo run --release
 ```
