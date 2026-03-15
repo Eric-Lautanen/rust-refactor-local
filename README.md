@@ -75,7 +75,7 @@ That's genuinely all of it.
 
 The whole point was to see how far you could push local LLM-assisted tooling on commodity hardware. Turns out: pretty far. The Ryzen 7 handles 4B parameter models at a usable speed (~15–25 tok/s), the egui UI stays responsive during inference, and the streaming terminal actually makes waiting for the LLM feel kinda cool instead of just... waiting.
 
-Is it as good as GPT-4 doing the same thing? No. Is it free, private, and runs on a laptop you already own? Also yes.
+Is it as good as Claude doing the same thing? No. Is it free, private, and runs on a laptop you already own? Also yes.
 
 ---
 
