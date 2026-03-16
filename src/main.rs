@@ -1448,15 +1448,11 @@ SOURCE ({path}):
                         (s.app_state.clone(), !s.files.is_empty())
                     };
 
-                    if has_files
-                        && (app_state == AppState::Paused
-                            || app_state == AppState::Processing
-                            || app_state == AppState::CargoChecking
-                            || matches!(app_state, AppState::FixingErrors(_)))
                     {
-                        let is_processing = app_state == AppState::Processing
-                            || app_state == AppState::CargoChecking
+                        let is_processing = matches!(app_state,
+                            AppState::Processing | AppState::CargoChecking)
                             || matches!(app_state, AppState::FixingErrors(_));
+                        let model_loaded = self.available_models.iter().any(|m| m.is_loaded);
                         let (btn_text, bg, fg) = if is_processing {
                             ("⏸  Pause", C_RED, C_TEXT)
                         } else {
@@ -1470,15 +1466,26 @@ SOURCE ({path}):
                         )
                         .fill(bg)
                         .corner_radius(4);
-                        if ui.add_sized([ui.available_width(), 26.0], btn)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked() {
+                        let enabled = is_processing || (model_loaded && has_files);
+                        let hover = if !model_loaded {
+                            "Load a model first"
+                        } else if !has_files {
+                            "Open a folder first"
+                        } else {
+                            ""
+                        };
+                        let resp = ui.add_enabled_ui(enabled, |ui| {
+                            ui.add_sized([ui.available_width(), 26.0], btn)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        }).inner;
+                        let resp = if !hover.is_empty() {
+                            resp.on_hover_text(hover)
+                        } else { resp };
+                        if resp.clicked() {
                             let next = if is_processing {
-                                // Cancel any active LLM stream immediately.
                                 self.llm_cancel.store(true, Ordering::Relaxed);
                                 AppState::Paused
                             } else {
-                                // Allow new LLM streams to start.
                                 self.llm_cancel.store(false, Ordering::Relaxed);
                                 AppState::Processing
                             };
@@ -2414,6 +2421,12 @@ SOURCE ({path}):
         match status {
             // --- Kick off analysis ---
             FileStatus::Pending => {
+                // Refuse to start if no model is loaded — pause and tell the user.
+                if !self.available_models.iter().any(|m| m.is_loaded) {
+                    state.app_state = AppState::Paused;
+                    state.push_log("  ⚠️  No model loaded — use ⚡ Load before starting.");
+                    return;
+                }
                 state.files[idx].status = FileStatus::Analyzing;
                 state.files[idx].analyzing_since = Some(Instant::now());
                 let content = state.files[idx].original_content.clone();
